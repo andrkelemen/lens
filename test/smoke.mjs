@@ -4,11 +4,12 @@
 // cover and this goes red — which is the only reason to trust it when it goes green.
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const LENS = join(here, '..', 'bin', 'lens.mjs');
 const FIXTURE = join(here, 'fixtures', 'sample.md');
+const FIXTURE_ABS = resolve(FIXTURE);
 
 let failed = 0;
 const run = (args, env = {}) => {
@@ -39,6 +40,14 @@ check('grep counts 3 matches', /^3 matches in /m.test(o), o);
 check('grep counts 1 file, not 3', /3 matches in 1 files/.test(o), o);
 check('grep names the file', o.includes('sample.md'), o);
 
+// grep — an ABSOLUTE path. On Windows it carries a drive colon (`C:/...`), and splitting
+// the grep line at the first colon reported every file as "C". On Linux this is the same
+// check with a plain absolute path, so it can only go red where the bug lives.
+o = run(['grep', 'needle', FIXTURE_ABS]);
+check('grep with an absolute path counts 1 file', /3 matches in 1 files/.test(o), o);
+check('grep with an absolute path names the file, not the drive', /^\s+3\s+\S*sample\.md$/m.test(o), o);
+check('grep sample lines carry the match text', /sample\.md:\d+:.*needle/.test(o), o);
+
 // Every truncation declares itself, and prints the command for the rest.
 o = run(['grep', 'needle', FIXTURE], { LENS_CAP: '1' });
 check('grep declares its truncation', /showing 1 of 3/.test(o), o);
@@ -55,6 +64,17 @@ check('sec stops at the next sibling', !o.includes('## Beta'), o);
 
 o = run(['sec', FIXTURE, 'nosuchheading']);
 check('sec reports a missing heading', /no heading matching/.test(o), o);
+
+// The headings index is capped and DECLARES it, like every other view.
+o = run(['sec', FIXTURE], { LENS_CAP: '2' });
+check('sec caps the headings index and says so', /showing 2 of 4/.test(o), o);
+
+// http — JSON shape, with no server: Node 18+ fetches data: URLs. An array whose first
+// element is null used to throw inside the parse and come out as "(not JSON)".
+o = run(['http', 'data:application/json,{"ok":true,"items":[1,2],"meta":null}']);
+check('http prints the top-level shape', /ok: boolean/.test(o) && /items: array\[2\]/.test(o) && /meta: null/.test(o), o);
+o = run(['http', 'data:application/json,[null,1]']);
+check('http array with a null first element is still JSON', /array\[2\], first: null/.test(o) && !/not JSON/.test(o), o);
 
 // http — an unreachable host is REPORTED, not thrown. Nothing about a health check
 // should be able to take down the thing running the health check.

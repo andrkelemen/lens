@@ -36,10 +36,11 @@ bytes and lies about nothing.
 git clone https://github.com/andrkelemen/lens.git
 cd lens
 npm install          # optional — only `lens db` needs the native sqlite module
-ln -s "$PWD/bin/lens.mjs" ~/.local/bin/lens
+npm link             # puts `lens` on PATH on every platform (a symlink on Unix, a shim on Windows)
 ```
 
-Node 18+. `grep`, `sec` and `http` have **zero dependencies** and work without `npm install`
+Node 18+. `lens grep` spawns `grep`, so it must be on PATH: on Windows that means running
+from Git Bash or adding `C:\Program Files\Git\usr\bin` to PATH. `grep`, `sec` and `http` have **zero dependencies** and work without `npm install`
 at all; `lens db` loads `better-sqlite3` lazily and tells you how to install it if it is
 missing. One of four views should not tax the other three.
 
