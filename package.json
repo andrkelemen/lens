@@ -1,0 +1,16 @@
+{
+  "name": "lens-views",
+  "version": "1.0.0",
+  "description": "Terse views of your own data that never paraphrase. Every truncation declares itself.",
+  "type": "module",
+  "bin": { "lens": "bin/lens.mjs" },
+  "files": ["bin/", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "keywords": ["cli", "llm", "context", "sqlite", "grep", "markdown", "projection"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/andrkelemen/lens.git" },
+  "scripts": { "test": "node test/smoke.mjs" }
+}
