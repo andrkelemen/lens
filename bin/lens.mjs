@@ -23,6 +23,7 @@
 */
 import { readFileSync, existsSync } from 'fs';
 import { execFileSync } from 'child_process';
+import { relative } from 'path';
 
 const DB = process.env.LENS_DB || '';
 const CAP = Number(process.env.LENS_CAP || 20);
@@ -54,7 +55,11 @@ async function db(sql) {
   // Read-only connection, not a promise of good behaviour: the driver refuses writes.
   const d = new Database(DB, { readonly: true });
   try {
-    const rows = d.prepare(sql).all();
+    const stmt = d.prepare(sql);
+    // A statement that returns no result set (PRAGMA with no output, DDL) is reported,
+    // not thrown: the driver refuses writes on this connection anyway.
+    if (!stmt.reader) return out('(statement returns no rows — lens db is read-only and shows result sets only)');
+    const rows = stmt.all();
     if (!rows.length) return out('(0 rows)');
     const cols = Object.keys(rows[0]);
     const shown = rows.slice(0, CAP);
@@ -83,29 +88,52 @@ function grep(pat, paths) {
       { encoding: 'utf8', maxBuffer: 1 << 26 }).split('\n').filter(Boolean);
   } catch (e) {
     if (e.status === 1) return out('(no matches)');
+    // Over the 64 MB buffer. The tool's own rule applies to its failures: say it, do not
+    // throw a stack trace at a reader who only wanted counts.
+    if (e.code === 'ENOBUFS') return out(`output over 64 MB for "${pat}" in ${targets.join(' ')} — narrow the path or the pattern`);
     throw e;
   }
+  // grep prints `file:line:text`. The filename is everything before the LAST colon that
+  // precedes the line number, not the first colon: on Windows the first colon is the drive
+  // letter (`C:/repo/a.md:3:text`), and splitting there reported every file as "C" —
+  // "47 matches in 1 files". Built on Linux, where a path never contains a colon, and found
+  // by the smoke test the first time it ran on Windows. Anchor on the `:<digits>:` grep
+  // always emits; a path with a colon elsewhere still parses.
+  const split = (l) => {
+    const m = /^((?:[A-Za-z]:)?[^:]*):(\d+):(.*)$/.exec(l);
+    return m ? { f: m[1], n: m[2], t: m[3] } : { f: l, n: '', t: '' };
+  };
+  // Paths are shown relative to the working directory so the capped sample line carries the
+  // match, not 120 characters of directory. Absolute inputs stay absolute when relative
+  // would climb out of the tree.
+  const show = (f) => { const r = relative(process.cwd(), f); return r && !r.startsWith('..') ? r : f; };
   // Count per file FIRST — the shape of the answer is where the matches live, which is
   // exactly what a capped list of lines destroys.
   const byFile = {};
-  for (const l of lines) { const f = l.slice(0, l.indexOf(':')); byFile[f] = (byFile[f] || 0) + 1; }
+  for (const l of lines) { const { f } = split(l); byFile[f] = (byFile[f] || 0) + 1; }
   const files = Object.entries(byFile).sort((a, b) => b[1] - a[1]);
   out(`${lines.length} matches in ${files.length} files`);
-  for (const [f, n] of files.slice(0, CAP)) out(`  ${String(n).padStart(4)}  ${f}`);
+  for (const [f, n] of files.slice(0, CAP)) out(`  ${String(n).padStart(4)}  ${show(f)}`);
   note(Math.min(CAP, files.length), files.length, `grep -rnc "${pat}" ${targets.join(' ')}`);
   out('');
-  for (const l of lines.slice(0, CAP)) out('  ' + l.replace(/\s+/g, ' ').slice(0, 160));
+  for (const l of lines.slice(0, CAP)) {
+    const { f, n, t } = split(l);
+    out('  ' + `${show(f)}:${n}:${t}`.replace(/\s+/g, ' ').slice(0, 160));
+  }
   note(Math.min(CAP, lines.length), lines.length, `grep -rn "${pat}" ${targets.join(' ')}`);
 }
 
 function sec(file, heading) {
   if (!file || !existsSync(file)) return out(`usage: lens sec <file> [heading]   (no such file: ${file})`);
-  const src = readFileSync(file, 'utf8').split('\n');
+  // CRLF files (Windows checkouts) are read as if LF: the view's bytes must not depend on
+  // which machine checked the file out.
+  const src = readFileSync(file, 'utf8').split('\n').map(l => l.replace(/\r$/, ''));
   const heads = src.map((l, i) => ({ l, i })).filter(x => /^#{1,6}\s/.test(x.l));
   if (!heading) {
     out(`${file}: ${src.length} lines, ${heads.length} headings`);
-    for (const h of heads) out(`  ${String(h.i + 1).padStart(5)}  ${h.l.slice(0, 110)}`);
-    note(heads.length, heads.length, `cat ${file}`);
+    // The index is capped like every other view; a 900-heading file is not a terse view.
+    for (const h of heads.slice(0, CAP)) out(`  ${String(h.i + 1).padStart(5)}  ${h.l.slice(0, 110)}`);
+    note(Math.min(CAP, heads.length), heads.length, `LENS_CAP=${heads.length} lens sec ${file}`);
     return;
   }
   const needle = heading.toLowerCase();
@@ -129,7 +157,12 @@ async function http(url) {
   try {
     const j = JSON.parse(body);
     const shape = (v) => Array.isArray(v) ? `array[${v.length}]` : (v === null ? 'null' : typeof v);
-    if (Array.isArray(j)) out(`array[${j.length}]` + (j.length ? `, keys: ${Object.keys(j[0]).join(', ')}` : ''));
+    // The first element's keys describe the array only when it IS an object; `[null, 1]`
+    // used to throw inside this try and come out as "(not JSON)", which is a lie.
+    const first = j[0];
+    const firstDesc = first && typeof first === 'object' && !Array.isArray(first)
+      ? `, keys: ${Object.keys(first).join(', ')}` : (j.length ? `, first: ${shape(first)}` : '');
+    if (Array.isArray(j)) out(`array[${j.length}]${firstDesc}`);
     else for (const [k, v] of Object.entries(j).slice(0, 40)) out(`  ${k}: ${shape(v)}`);
     out(`\nfull: curl -s ${url}`);
   } catch { out('  (not JSON)\n  ' + body.slice(0, 200).replace(/\s+/g, ' ')); }

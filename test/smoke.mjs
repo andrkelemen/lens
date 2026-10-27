@@ -4,11 +4,14 @@
 // cover and this goes red — which is the only reason to trust it when it goes green.
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
+import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const LENS = join(here, '..', 'bin', 'lens.mjs');
 const FIXTURE = join(here, 'fixtures', 'sample.md');
+const FIXTURE_ABS = resolve(FIXTURE);
 
 let failed = 0;
 const run = (args, env = {}) => {
@@ -39,6 +42,32 @@ check('grep counts 3 matches', /^3 matches in /m.test(o), o);
 check('grep counts 1 file, not 3', /3 matches in 1 files/.test(o), o);
 check('grep names the file', o.includes('sample.md'), o);
 
+// grep — a path that actually CONTAINS a drive-letter colon. The absolute-path check
+// below cannot go red on Linux, because a Linux absolute path has no colon in it: run on
+// this platform it asserts nothing about the bug it was written for. So build the shape
+// directly, in a temp directory, from a filename that begins `C:` — which is what grep
+// prints on Windows and what the old first-colon split turned into a file called "C".
+//
+// The fixture is created at runtime rather than committed: a colon is legal in a POSIX
+// filename and illegal in a Windows one, so committing it would break the checkout on the
+// platform the bug belongs to. Skipped there, where the real path form occurs anyway.
+if (process.platform !== 'win32') {
+  const tmp = mkdtempSync(join(tmpdir(), 'lens-drive-'));
+  const drive = join(tmp, 'C:sample.md');
+  writeFileSync(drive, 'one needle\ntwo needle\n');
+  const o2 = execFileSync('node', [LENS, 'grep', 'needle', 'C:sample.md'], { encoding: 'utf8', cwd: tmp });
+  check('grep keeps a drive-letter path whole, not just "C"', /2 matches in 1 files/.test(o2) && /C:sample\.md/.test(o2), o2);
+  check('grep does not report the drive as the file', !/^\s+\d+\s+C$/m.test(o2), o2);
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+// grep — an ABSOLUTE path. On Windows it carries a drive colon; on Linux this is just a
+// plain absolute path, so it guards the parse without exercising the drive case above.
+o = run(['grep', 'needle', FIXTURE_ABS]);
+check('grep with an absolute path counts 1 file', /3 matches in 1 files/.test(o), o);
+check('grep with an absolute path names the file, not the drive', /^\s+3\s+\S*sample\.md$/m.test(o), o);
+check('grep sample lines carry the match text', /sample\.md:\d+:.*needle/.test(o), o);
+
 // Every truncation declares itself, and prints the command for the rest.
 o = run(['grep', 'needle', FIXTURE], { LENS_CAP: '1' });
 check('grep declares its truncation', /showing 1 of 3/.test(o), o);
@@ -55,6 +84,17 @@ check('sec stops at the next sibling', !o.includes('## Beta'), o);
 
 o = run(['sec', FIXTURE, 'nosuchheading']);
 check('sec reports a missing heading', /no heading matching/.test(o), o);
+
+// The headings index is capped and DECLARES it, like every other view.
+o = run(['sec', FIXTURE], { LENS_CAP: '2' });
+check('sec caps the headings index and says so', /showing 2 of 4/.test(o), o);
+
+// http — JSON shape, with no server: Node 18+ fetches data: URLs. An array whose first
+// element is null used to throw inside the parse and come out as "(not JSON)".
+o = run(['http', 'data:application/json,{"ok":true,"items":[1,2],"meta":null}']);
+check('http prints the top-level shape', /ok: boolean/.test(o) && /items: array\[2\]/.test(o) && /meta: null/.test(o), o);
+o = run(['http', 'data:application/json,[null,1]']);
+check('http array with a null first element is still JSON', /array\[2\], first: null/.test(o) && !/not JSON/.test(o), o);
 
 // http — an unreachable host is REPORTED, not thrown. Nothing about a health check
 // should be able to take down the thing running the health check.
