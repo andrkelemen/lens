@@ -170,7 +170,14 @@ async function db(sql) {
     // A statement that returns no result set (PRAGMA with no output, DDL) is reported,
     // not thrown: the driver refuses writes on this connection anyway.
     if (!stmt.reader) return out('(statement returns no rows — lens db is read-only and shows result sets only)');
-    const rows = stmt.all();
+    // `stmt.reader` is TRUE for statements the read-only connection still refuses to run —
+    // `PRAGMA optimize` is one: it reads AND writes, so it claims a result set and then
+    // throws "attempt to write a readonly database". The tool's own rule applies to its own
+    // failures: report it, never hand the reader a stack trace. Found 2026-10-29 by a test
+    // written for the backport; the public copy had the same hole, untested.
+    let rows;
+    try { rows = stmt.all(); }
+    catch (e) { return out(`sqlite refused the statement: ${e.message}`); }
     if (!rows.length) return out('(0 rows)');
     const cols = Object.keys(rows[0]);
     const shown = rows.slice(0, CAP);
