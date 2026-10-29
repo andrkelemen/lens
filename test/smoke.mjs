@@ -78,6 +78,11 @@ o = run(['grep', 'needle', FIXTURE], { LENS_CAP: '1' });
 check('grep declares its truncation', /showing 1 of 3/.test(o), o);
 check('truncation prints the full command', /full: grep -rn/.test(o), o);
 
+// A grep that cannot start is a sentence, not a spawnSync ENOENT stack trace: on Windows
+// outside Git's bash that was every grep call.
+o = run(['grep', 'alpha', FIXTURE], { LENS_GREP: join(SANDBOX, 'no-such-grep.exe') });
+check('a grep that cannot start says so, no stack trace', /could not start/.test(o) && !/at .*\.mjs/.test(o), o);
+
 // sec — headings index, then one section bounded by the next heading of equal depth.
 o = run(['sec', FIXTURE]);
 check('sec lists every heading', (o.match(/^\s+\d+\s+#/gm) || []).length === 4, o);
@@ -138,7 +143,10 @@ check('a cut hands over a working route', /lens more \S+/.test(o), o);
 check('a cut says re-running will not help', /It is not a flake\./.test(o), o);
 
 const teePath = (o.match(/already written: (\S+)/) || [])[1];
-check('the tee file is owner-only', teePath && (statSync(teePath).mode & 0o777) === 0o600,
+// Windows has no POSIX mode bits: Node reports 0666 or 0444 whatever was asked for, and the
+// file's privacy comes from the profile folder's ACL instead. Skipped there, out loud.
+if (process.platform === 'win32') console.log('  skip  the tee file is owner-only (no POSIX modes on Windows)');
+else check('the tee file is owner-only', teePath && (statSync(teePath).mode & 0o777) === 0o600,
   teePath ? '0' + (statSync(teePath).mode & 0o777).toString(8) : 'no tee path');
 check('the tee holds EVERY line, not the capped set',
   teePath && readFileSync(teePath, 'utf8').split('\n').filter(Boolean).length === 50, teePath);
