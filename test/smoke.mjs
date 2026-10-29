@@ -5,7 +5,7 @@
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join, resolve } from 'path';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, rmSync, statSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -14,9 +14,14 @@ const FIXTURE = join(here, 'fixtures', 'sample.md');
 const FIXTURE_ABS = resolve(FIXTURE);
 
 let failed = 0;
+// Every run is pointed at a throwaway tee store. Without this the loop guard and the tee
+// files land in the developer's real ~/.cache/lens, which both pollutes their machine and
+// makes the suite's own repeated calls trip the guard — a test that contaminates the thing
+// it measures.
+const SANDBOX = mkdtempSync(join(tmpdir(), 'lens-sandbox-'));
 const run = (args, env = {}) => {
   try {
-    return execFileSync('node', [LENS, ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
+    return execFileSync('node', [LENS, ...args], { encoding: 'utf8', env: { ...process.env, LENS_TEE: SANDBOX, ...env } });
   } catch (e) {
     return (e.stdout || '') + (e.stderr || '');
   }
@@ -109,6 +114,77 @@ try {
   piped = execFileSync('bash', ['-c', `node ${LENS} sec ${FIXTURE} 2>&1 | head -1`], { encoding: 'utf8' });
 } catch (e) { piped = (e.stdout || '') + (e.stderr || ''); }
 check('piping to head prints no stack trace', !/Error|at Object/.test(piped), piped);
+
+// ── THE NO-EATING CONTRACT ────────────────────────────────────────────────
+// Each of these is a specific way a projecting tool lies to its reader. The one they
+// exist for: a capped view, no working route to the rest, so the reader runs it again,
+// gets the same thing, and invents the remainder.
+const TEE = mkdtempSync(join(tmpdir(), 'lens-tee-'));
+const E = { LENS_TEE: TEE };
+const BIG = join(TEE, 'big.txt');
+writeFileSync(BIG, Array.from({ length: 50 }, (_, i) => `needle line ${i}`).join('\n') + '\n');
+const SMALL = join(TEE, 'small.txt');
+writeFileSync(SMALL, 'alpha\nbeta\nalpha\n');
+
+// A view that cut nothing must SAY it cut nothing — otherwise a short answer and a
+// truncated one are indistinguishable, which is how a reader stops checking.
+o = run(['grep', 'alpha', SMALL], E);
+check('completeness is asserted out loud', /complete: \d+ of \d+\. Nothing was cut\./.test(o), o);
+
+o = run(['grep', 'needle', BIG], { ...E, LENS_CAP: '5' });
+check('a cut states how many were withheld', /NOT shown/.test(o), o);
+check('a cut names the tee file', /exact bytes, already written: \S+/.test(o), o);
+check('a cut hands over a working route', /lens more \S+/.test(o), o);
+check('a cut says re-running will not help', /It is not a flake\./.test(o), o);
+
+const teePath = (o.match(/already written: (\S+)/) || [])[1];
+check('the tee file is owner-only', teePath && (statSync(teePath).mode & 0o777) === 0o600,
+  teePath ? '0' + (statSync(teePath).mode & 0o777).toString(8) : 'no tee path');
+check('the tee holds EVERY line, not the capped set',
+  teePath && readFileSync(teePath, 'utf8').split('\n').filter(Boolean).length === 50, teePath);
+
+// The promised route must actually reach the end. A route that stops short is the
+// original bug with extra steps.
+o = run(['more', teePath, '1', '9999'], E);
+check('lens more reaches the last line', /needle line 49/.test(o) && /complete: reached the end/.test(o), o);
+o = run(['more', teePath, '1', '10'], E);
+check('a page that is not the last points at the next', /next:  lens more \S+ 11/.test(o), o);
+
+// Secrets must never reach the reader's context, and the redaction must be announced:
+// a silent redaction is a silent cut.
+const ENVF = join(TEE, 'env.txt');
+writeFileSync(ENVF, 'OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\nGITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n');
+o = run(['grep', 'KEY|TOKEN', ENVF], E);
+check('secret values are redacted', !o.includes('abcdefghijklmnopqrstuvwxyz123456') && !o.includes('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345'), o);
+check('the redaction is declared', /secret-shaped value/.test(o), o);
+o = run(['grep', 'KEY', ENVF], { ...E, LENS_NO_REDACT: '1' });
+check('LENS_NO_REDACT=1 is the escape hatch', o.includes('abcdefghijklmnopqrstuvwxyz123456'), o);
+
+// lens run must not swallow anything. The stderr case is here because the first
+// implementation used execFileSync, which discards stderr when the command exits 0.
+o = run(['run', 'echo out-line; echo err-line >&2'], E);
+check('lens run shows stderr even on success', /err-line/.test(o), o);
+check('lens run puts stderr before stdout', o.indexOf('--- stderr ---') < o.indexOf('--- stdout ---'), o);
+const rt = (o.match(/exact bytes: (\S+)/) || [])[1];
+check('lens run tees stdout AND stderr',
+  rt && readFileSync(rt, 'utf8').includes('out-line') && readFileSync(rt, 'utf8').includes('err-line'), rt);
+
+o = run(['run', 'for i in $(seq 1 30); do echo "error number $i"; done'], { ...E, LENS_CAP: '3' });
+check('tallies are computed before capping', /30 error/.test(o) && /27 NOT shown/.test(o), o);
+
+// A section is the one view whose job is the whole text.
+o = run(['sec', FIXTURE, 'Alpha'], { ...E, LENS_CAP: '2' });
+check('lens sec never caps a section', /complete: section printed in full/.test(o), o);
+
+// The loop guard. Hope is the first step; say it is unfounded.
+run(['grep', 'beta', SMALL], E);
+o = run(['grep', 'beta', SMALL], E);
+check('an identical call announces itself', /identical lens call/.test(o) && /NOT hiding behind another run/.test(o), o);
+o = run(['grep', 'zeta-unused-pattern', SMALL], E);
+check('a different call does not trip the guard', !/identical lens call/.test(o), o);
+
+rmSync(TEE, { recursive: true, force: true });
+rmSync(SANDBOX, { recursive: true, force: true });
 
 // No arguments prints the usage rather than failing.
 o = run([]);

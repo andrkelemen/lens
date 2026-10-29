@@ -143,3 +143,63 @@ coverage it does not have.
 ## License
 
 MIT
+
+## The no-eating contract
+
+A capped view is only safe if the way back to the rest is real. The failure this prevents is
+not the cap — it is the loop:
+
+> an incomplete view → no working route to the remainder → the same command run again in the
+> hope of a fuller answer → the same incomplete thing → the gap filled from the model's prior.
+
+The fabrication is the last step. The first is hope. So every capped view:
+
+1. **tees the exact bytes to disk first**, before anything is counted or capped — mode `0600`,
+   in `$LENS_TEE` (default `~/.cache/lens`). The projection is never the only copy.
+2. **names that file**, not a hash and not a subcommand to learn, and hands over
+   `lens more <path>` — which is tested to reach the last line.
+3. **still prints the command** for the whole thing, so a deterministic source has two routes.
+4. **says re-running will not help**: *"It is not a flake."*
+5. **announces an identical lens call** made in the last 30 minutes, before the output is read.
+6. **asserts completeness when nothing was cut** — `complete: 7 of 7. Nothing was cut.` A short
+   answer and a truncated one must not look alike.
+
+`lens sec <file> <heading>` never caps. A section's whole job is the full text, and capping it
+is exactly how a reader ends up inventing the rest.
+
+## Secrets
+
+Redaction is on by default, and **declared**: `⚠ 2 secret-shaped values redacted`. Token shapes
+(`ghp_…`, `sk-…`, `AKIA…`, PEM headers) and credential-named assignments (`GITHUB_TOKEN=`,
+`DATABASE_URL=`, `AWS_SECRET_ACCESS_KEY=`, `Authorization: Bearer …`) are replaced in place.
+Nothing else is dropped. `LENS_NO_REDACT=1` to see them.
+
+A silent redaction is a silent cut, which is the thing this tool exists to refuse.
+
+## `lens run`
+
+```
+lens run "npm test"
+```
+
+Runs it, tees the exact combined bytes, then projects: exit code, line counts, an
+error/warning tally computed over the **whole** output, **stderr first and whole**, stdout
+capped with the path to the rest. The real exit code propagates, so your own check can still
+go red.
+
+It does not do "failures only, passing collapsed to a count". That shape reads well and then
+cannot answer a question about a test that passed.
+
+## On transparent interceptors
+
+The other design in this space installs shell hooks and rewrites `cat`, `grep` or `git`
+underneath the agent. Those tools do good compression work, and three of their mechanisms were
+better than this file's first version: teeing full output behind a handle, scrubbing
+credentials, and asserting exact overflow counts in tests. All three are adopted here.
+
+The interception is not. When the agent believes it ran `cat`, it attributes the projection to
+the real tool and reasons as though it had seen the file. lens is opt-in and named: typing
+`lens sec` is itself the admission that this is a projection, and that admission is the point.
+
+For the same reason there is no config file. A checked-out repository does not get to
+configure how you read it.

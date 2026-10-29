@@ -1,16 +1,41 @@
 {
   "name": "lens-views",
-  "version": "1.0.0",
-  "description": "Terse views of your own data that never paraphrase. Every truncation declares itself.",
+  "version": "1.1.0",
+  "description": "Terse views of your own data that never paraphrase. Every truncation declares itself and hands over a working route to the rest.",
   "type": "module",
-  "bin": { "lens": "bin/lens.mjs" },
-  "files": ["bin/", "README.md", "LICENSE"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "lens": "bin/lens.mjs"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "optionalDependencies": {
     "better-sqlite3": "^11.0.0"
   },
-  "keywords": ["cli", "llm", "context", "sqlite", "grep", "markdown", "projection"],
+  "keywords": [
+    "agents",
+    "cli",
+    "context",
+    "grep",
+    "llm",
+    "markdown",
+    "projection",
+    "redaction",
+    "secrets",
+    "sqlite",
+    "tee"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/andrkelemen/lens.git" },
-  "scripts": { "test": "node test/smoke.mjs" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andrkelemen/lens.git"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  }
 }

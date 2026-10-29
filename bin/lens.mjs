@@ -15,18 +15,53 @@
   puts a paraphrase between the reader and the truth and decides, on the reader's behalf,
   what mattered. That decision is exactly the one you cannot audit afterwards.
 
+  THE NO-EATING CONTRACT. A capped view is only safe if the way back to the rest is real.
+  The failure it prevents is specific and it is not the cap — it is the loop. A model reads
+  an incomplete view, finds no working route to the remainder, runs the same command again
+  expecting a fuller answer, gets the same thing, and fills the gap from its prior. The
+  fabrication is the last step; the first is hope. So:
+
+    * the exact bytes are TEED to disk before anything is counted or capped (0600, in
+      $LENS_TEE, default ~/.cache/lens). The projection is never the only copy.
+    * the cut states how many were withheld, and names the FILE — not a hash, not a
+      subcommand to learn — plus `lens more <path>`, which is tested to reach the last line.
+    * it says that re-running will not help.
+    * an identical lens call inside 30 minutes announces itself BEFORE the output is read.
+    * when nothing was cut, that is asserted out loud: "complete: 7 of 7. Nothing was cut."
+      A short answer and a truncated one must not look alike.
+    * `lens sec <file> <heading>` never caps. A section's whole job is the full text.
+
+  SECRETS are redacted by default and the redaction is DECLARED, because a silent redaction
+  is a silent cut and that is the thing this tool refuses.
+
+  ON TRANSPARENT INTERCEPTORS — the other design, and why this is not it. Tools in this
+  space often install shell hooks and rewrite `cat`, `grep` or `git` underneath the agent.
+  Their compression work is good and some of their mechanisms are better than this file's
+  first version was: teeing full output behind a handle, scrubbing credentials, asserting
+  exact overflow counts in tests. All three are adopted here. What is deliberately not
+  adopted is the interception: when the agent believes it ran `cat`, it attributes the
+  projection to the real tool and reasons as though it had seen the file. lens is opt-in and
+  named. Typing `lens sec` is itself the admission that this is a projection, and that
+  admission is the feature. For the same reason there is no config file: a checked-out
+  repository does not get to configure how you read it.
+
   usage:
     lens db "<sql>"               read-only SQL against $LENS_DB
     lens grep <pat> [path...]     match counts per file, then capped lines
     lens sec <file> [heading]     a markdown file's headings, or ONE section in full
     lens http <url>               status + top-level shape of a JSON response, not the body
+    lens run <command…>           run it, project the output, tee the exact bytes
+    lens more <file> [from] [n]   page the rest of a capped view — never re-run
 */
-import { readFileSync, existsSync } from 'fs';
-import { execFileSync } from 'child_process';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
+import { execFileSync, spawnSync } from 'child_process';
+import { createHash } from 'crypto';
+import { homedir } from 'os';
 import { relative } from 'path';
 
 const DB = process.env.LENS_DB || '';
 const CAP = Number(process.env.LENS_CAP || 20);
+const TEE_DIR = process.env.LENS_TEE || `${homedir()}/.cache/lens`;
 const [cmd, ...rest] = process.argv.slice(2);
 
 // EPIPE: `lens ... | head` closes stdout mid-write. On runtimes that surface that as an
@@ -36,9 +71,85 @@ const [cmd, ...rest] = process.argv.slice(2);
 // trace) rather than pretending to exercise this line.
 process.stdout.on('error', (e) => { if (e.code === 'EPIPE') process.exit(0); throw e; });
 const out = (s) => { try { process.stdout.write(s + '\n'); } catch (e) { if (e.code !== 'EPIPE') throw e; } };
-const note = (shown, total, how) => {
-  if (total > shown) out(`\n… showing ${shown} of ${total}. full: ${how}`);
+let CUT = false;
+const note = (shown, total, how, teePath) => {
+  if (total > shown) {
+    CUT = true;
+    out(`\n… showing ${shown} of ${total} — ${total - shown} NOT shown.`);
+    if (teePath) {
+      out(`   all ${total}, exact bytes, already written: ${teePath}`);
+      out(`   read the rest:  lens more ${teePath}`);
+      out(`   re-running this lens call will print the same ${shown}. It is not a flake.`);
+    }
+    // The command for the whole thing is printed EITHER WAY. The first version of the tee
+    // replaced it, which a test caught: for a deterministic source the command is still an
+    // honest route, and removing a working route to add a better one is a net loss.
+    out(`   full: ${how}`);
+  } else {
+    out(`\ncomplete: ${total} of ${total}. Nothing was cut.`);
+  }
 };
+
+// ── TEE ─────────────────────────────────────────────────────────────────────
+// The exact bytes, owner-only, so a capped view can point at the whole thing instead of
+// promising that re-running the command produces the same answer. For a test run, a build
+// or an HTTP call, it does not.
+function tee(label, content) {
+  try {
+    mkdirSync(TEE_DIR, { recursive: true, mode: 0o700 });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const path = `${TEE_DIR}/${ts}-${label.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 40)}.txt`;
+    // 0600 at creation, not chmod afterwards: a reader racing the chmod sees 0644.
+    writeFileSync(path, content, { mode: 0o600 });
+    return path;
+  } catch { return null; }   // a tee that fails must never take the view down with it
+}
+
+// ── REDACTION ───────────────────────────────────────────────────────────────
+const SECRET_NAMES = [
+  'GITHUB_TOKEN', 'GITHUB_PAT', 'GH_TOKEN', 'GITLAB_TOKEN', 'API_TOKEN', 'AUTH_TOKEN',
+  'ACCESS_TOKEN', 'BEARER_TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'PRIVATE_KEY',
+  'API_KEY', 'APIKEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SESSION_TOKEN',
+  'AZURE_CLIENT_SECRET', 'NPM_TOKEN', 'NUGET_API_KEY', 'CONNECTION_STRING', 'DATABASE_URL',
+  'KUBECONFIG', 'DOCKER_CONFIG', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+];
+const SECRET_PATTERNS = [
+  [new RegExp(`\\b(${SECRET_NAMES.join('|')})(\\s*[=:]\\s*"?)([^\\s"',}]{6,})`, 'gi'), (m, n, sep) => `${n}${sep}[REDACTED]`],
+  [/\b(Authorization\s*:\s*)(token|Bearer)\s+\S+/gi, (m, a, k) => `${a}${k} [REDACTED]`],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, () => '[REDACTED gh token]'],
+  [/\bsk-[A-Za-z0-9_-]{20,}/g, () => '[REDACTED sk key]'],
+  [/\bAKIA[0-9A-Z]{16}\b/g, () => '[REDACTED aws key id]'],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, () => '[REDACTED private key]'],
+];
+let REDACTED = 0;
+function redact(text) {
+  if (process.env.LENS_NO_REDACT === '1' || typeof text !== 'string') return text;
+  let t = text;
+  for (const [re, fn] of SECRET_PATTERNS) t = t.replace(re, (...a) => { REDACTED++; return fn(...a); });
+  return t;
+}
+
+// ── THE LOOP GUARD ──────────────────────────────────────────────────────────
+// The loop begins with hope: the same call again, in the expectation of a fuller answer.
+// So say up front that the expectation is unfounded. Best-effort — a guard that can break
+// the tool is worse than no guard.
+function loopGuard(key) {
+  try {
+    mkdirSync(`${TEE_DIR}/.calls`, { recursive: true, mode: 0o700 });
+    const f = `${TEE_DIR}/.calls/${createHash('sha256').update(key).digest('hex').slice(0, 16)}.json`;
+    let prev = null;
+    if (existsSync(f)) { try { prev = JSON.parse(readFileSync(f, 'utf8')); } catch {} }
+    const now = Date.now();
+    if (prev && now - prev.at < 30 * 60 * 1000) {
+      const mins = Math.round((now - prev.at) / 60000);
+      out(`⟳ identical lens call ${mins === 0 ? 'under a minute' : mins + ' min'} ago. The output below is produced`);
+      out(`  the same way, deterministically, from the same source. If it was incomplete then it is`);
+      out(`  incomplete now — the remainder is NOT hiding behind another run.${prev.tee ? ` Last exact bytes: ${prev.tee}` : ''}`);
+      out('');
+    }
+    return (teePath) => { try { writeFileSync(f, JSON.stringify({ at: now, key, tee: teePath || prev?.tee || null }), { mode: 0o600 }); } catch {} };
+  } catch { return () => {}; }
+}
 
 async function db(sql) {
   if (!sql) return out('usage: lens db "<sql>"   (set LENS_DB to the sqlite file)');
@@ -65,14 +176,19 @@ async function db(sql) {
     const shown = rows.slice(0, CAP);
     const w = {};
     for (const c of cols) w[c] = Math.min(46, Math.max(c.length, ...shown.map(r => String(r[c] ?? '').replace(/\s+/g, ' ').length)));
-    out(cols.map(c => c.padEnd(w[c])).join('  '));
+    // Tee every row BEFORE capping, as TSV, so the capped table is never the only copy.
+    const teePath = rows.length > shown.length
+      ? tee('db', cols.join('\t') + '\n' + rows.map(r => cols.map(c => String(r[c] ?? '').replace(/\t/g, ' ')).join('\t')).join('\n'))
+      : null;
+    out(redact(cols.map(c => c.padEnd(w[c])).join('  ')));
     for (const r of shown) {
-      out(cols.map(c => {
+      out(redact(cols.map(c => {
         const v = String(r[c] ?? '').replace(/\s+/g, ' ');
         return (v.length > w[c] ? v.slice(0, w[c] - 1) + '…' : v).padEnd(w[c]);
-      }).join('  '));
+      }).join('  ')));
     }
-    note(shown.length, rows.length, `LENS_CAP=${rows.length} lens db "…"`);
+    note(shown.length, rows.length, `LENS_CAP=${rows.length} lens db "…"`, teePath);
+    SAVE(teePath);
   } finally { d.close(); }
 }
 
@@ -112,15 +228,17 @@ function grep(pat, paths) {
   const byFile = {};
   for (const l of lines) { const { f } = split(l); byFile[f] = (byFile[f] || 0) + 1; }
   const files = Object.entries(byFile).sort((a, b) => b[1] - a[1]);
+  const teePath = (files.length > CAP || lines.length > CAP) ? tee(`grep-${pat}`, lines.join('\n')) : null;
   out(`${lines.length} matches in ${files.length} files`);
   for (const [f, n] of files.slice(0, CAP)) out(`  ${String(n).padStart(4)}  ${show(f)}`);
-  note(Math.min(CAP, files.length), files.length, `grep -rnc "${pat}" ${targets.join(' ')}`);
+  note(Math.min(CAP, files.length), files.length, `grep -rnc "${pat}" ${targets.join(' ')}`, teePath);
   out('');
   for (const l of lines.slice(0, CAP)) {
     const { f, n, t } = split(l);
-    out('  ' + `${show(f)}:${n}:${t}`.replace(/\s+/g, ' ').slice(0, 160));
+    out('  ' + redact(`${show(f)}:${n}:${t}`.replace(/\s+/g, ' ').slice(0, 160)));
   }
-  note(Math.min(CAP, lines.length), lines.length, `grep -rn "${pat}" ${targets.join(' ')}`);
+  note(Math.min(CAP, lines.length), lines.length, `grep -rn "${pat}" ${targets.join(' ')}`, teePath);
+  SAVE(teePath);
 }
 
 function sec(file, heading) {
@@ -143,7 +261,80 @@ function sec(file, heading) {
   const after = heads.find(h => h.i > start.i && (h.l.match(/^#+/) || ['#'])[0].length <= depth);
   const end = after ? after.i : src.length;
   out(`${file}:${start.i + 1}-${end}  (${end - start.i} lines of ${src.length})`);
-  out(src.slice(start.i, end).join('\n'));
+  // A section prints WHOLE — no cap, ever. This is the one view whose job is the full text,
+  // and capping it is precisely how a reader ends up inventing the rest.
+  out(redact(src.slice(start.i, end).join('\n')));
+  out(`\ncomplete: section printed in full (${end - start.i} lines). rest of file: lens sec ${file}`);
+}
+
+// Page the remainder. The loop-breaker: the rest of a capped view is retrievable in slices,
+// so there is never a reason to re-run whatever produced it.
+function more(file, from, count) {
+  if (!file || !existsSync(file)) return out(`usage: lens more <file> [fromLine] [count]   (no such file: ${file})`);
+  const lines = readFileSync(file, 'utf8').split('\n').map(l => l.replace(/\r$/, ''));
+  const start = Math.max(1, Number(from || 1));
+  const n = Number(count || CAP * 5);
+  out(`${file}  lines ${start}-${Math.min(start + n - 1, lines.length)} of ${lines.length}`);
+  for (const l of lines.slice(start - 1, start - 1 + n)) out(redact(l));
+  if (start - 1 + n < lines.length) {
+    out(`\n… ${lines.length - (start - 1 + n)} lines further on.`);
+    out(`   next:  lens more ${file} ${start + n}`);
+  } else {
+    out('\ncomplete: reached the end of the file.');
+  }
+}
+
+// Run a command and PROJECT its output. The exact combined bytes are teed FIRST, before
+// anything is counted or capped, so the projection can never be the only copy. stderr is
+// never hidden and the exit code is never implied by a summary: "failures only, passing
+// collapsed to a count" is how you end up unable to answer a question about a test that
+// passed.
+function run(parts) {
+  if (!parts.length) return out('usage: lens run <command…>');
+  const command = parts.join(' ');
+  // spawnSync, NOT execFileSync. execFileSync returns stdout and DISCARDS stderr when the
+  // command succeeds — it hands you both only on the throw path. A command exiting 0 while
+  // writing warnings to stderr lost them silently, in the function whose whole job is not
+  // to eat output. The test caught it within a minute of being written.
+  const res = spawnSync(process.platform === 'win32' ? process.env.COMSPEC || 'cmd' : 'sh',
+    process.platform === 'win32' ? ['/c', command] : ['-c', command],
+    { encoding: 'utf8', maxBuffer: 1 << 28 });
+  const stdout = res.stdout ?? '';
+  const stderr = res.stderr ?? '';
+  const code = res.error ? 1 : (typeof res.status === 'number' ? res.status : 1);
+  if (res.error) out(`lens run: ${res.error.message}`);
+  const combined = stdout + (stderr ? (stdout ? '\n' : '') + stderr : '');
+  const teePath = tee(`run-${parts[0]}`, combined);
+  const sLines = stdout ? stdout.replace(/\n$/, '').split('\n') : [];
+  const eLines = stderr ? stderr.replace(/\n$/, '').split('\n') : [];
+
+  out(`$ ${command}`);
+  out(`exit ${code}  ·  stdout ${sLines.length} lines  ·  stderr ${eLines.length} lines  ·  ${combined.length}B`);
+
+  // Tallies are computed over the WHOLE output, before any capping. A count that only
+  // counts the shown part is worse than no count.
+  const all = combined.split('\n');
+  const hits = (re) => all.filter(l => re.test(l)).length;
+  const tally = [['error', hits(/\berror\b/i)], ['warning', hits(/\bwarn(ing)?\b/i)],
+                 ['fail', hits(/\bfail(ed|ure)?\b/i)], ['fatal', hits(/\b(fatal|panic)\b/i)]]
+    .filter(([, n]) => n > 0);
+  if (tally.length) out('matched: ' + tally.map(([k, n]) => `${n} ${k}`).join(' · '));
+
+  // stderr first: if something went wrong, that is the answer.
+  if (eLines.length) {
+    out('\n--- stderr ---');
+    for (const l of eLines.slice(0, CAP)) out(redact(l));
+    note(Math.min(CAP, eLines.length), eLines.length, `${command} 2>&1 1>/dev/null`, teePath);
+  }
+  if (sLines.length) {
+    out('\n--- stdout ---');
+    for (const l of sLines.slice(0, CAP)) out(redact(l));
+    note(Math.min(CAP, sLines.length), sLines.length, command, teePath);
+  }
+  if (!sLines.length && !eLines.length) out('(no output)');
+  if (teePath && !CUT) out(`exact bytes: ${teePath}`);
+  SAVE(teePath);
+  process.exitCode = code;   // the caller's own check must still be able to go red
 }
 
 async function http(url) {
@@ -168,15 +359,27 @@ async function http(url) {
   } catch { out('  (not JSON)\n  ' + body.slice(0, 200).replace(/\s+/g, ' ')); }
 }
 
+const SAVE = loopGuard([cmd, ...rest].join(' '));
+
 switch (cmd) {
   case 'db': await db(rest.join(' ')); break;
   case 'grep': grep(rest[0], rest.slice(1)); break;
   case 'sec': sec(rest[0], rest.slice(1).join(' ')); break;
   case 'http': await http(rest[0]); break;
+  case 'more': more(rest[0], rest[1], rest[2]); break;
+  case 'run': run(rest); break;
   default:
     out('lens — terse views that never paraphrase. LENS_CAP=n to widen (default 20).');
     out('  lens db "<sql>"            read-only SQL against $LENS_DB');
     out('  lens grep <pat> [path...]  match counts per file, then capped lines');
     out('  lens sec <file> [heading]  headings index, or one section in full');
     out('  lens http <url>            status + JSON shape, never the body');
+    out('  lens run <command…>        run it, project the output, tee the exact bytes');
+    out('  lens more <file> [from] [n]  page the rest of a capped view — never re-run');
+}
+
+// A silent redaction is a silent truncation, which is the thing this tool exists to refuse.
+if (REDACTED > 0) {
+  out(`\n⚠ ${REDACTED} secret-shaped value${REDACTED === 1 ? '' : 's'} redacted from the output above.`);
+  out('  The characters were replaced, nothing else was dropped. LENS_NO_REDACT=1 to see them.');
 }
