@@ -57,7 +57,7 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import { homedir } from 'os';
-import { relative } from 'path';
+import { relative, join } from 'path';
 
 const DB = process.env.LENS_DB || '';
 const CAP = Number(process.env.LENS_CAP || 20);
@@ -103,6 +103,25 @@ function tee(label, content) {
     writeFileSync(path, content, { mode: 0o600 });
     return path;
   } catch { return null; }   // a tee that fails must never take the view down with it
+}
+
+// ── POSIX TOOLS ON WINDOWS ──────────────────────────────────────────────────
+// `grep` and `sh` are on every Unix PATH and on almost no Windows one: they ship inside Git
+// for Windows, which puts them on PATH only in its own bash. Asking for them by bare name
+// from PowerShell died with a spawnSync ENOENT stack trace, and `lens run` fell back to
+// cmd.exe, which reads `a; b >&2` as one echo to stderr and still reported "Nothing was
+// cut" — a wrong answer that looks right. Resolve them once: LENS_GREP / LENS_SH win, then
+// PATH, then Git's own folders. Git\bin\sh.exe before usr\bin: the bin one is the wrapper
+// that puts usr\bin (seq, sed, …) on the PATH of the script it runs.
+function posixTool(name) {
+  const override = process.env[`LENS_${name.toUpperCase()}`];
+  if (override) return override;
+  if (process.platform !== 'win32') return name;
+  const git = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, 'Programs')]
+    .filter(Boolean).map(d => join(d, 'Git'));
+  const dirs = [...(process.env.PATH || '').split(';'), ...git.map(g => join(g, 'bin')), ...git.map(g => join(g, 'usr', 'bin'))];
+  for (const d of dirs) { if (d && existsSync(join(d, `${name}.exe`))) return join(d, `${name}.exe`); }
+  return null;
 }
 
 // ── REDACTION ───────────────────────────────────────────────────────────────
@@ -202,15 +221,18 @@ async function db(sql) {
 function grep(pat, paths) {
   if (!pat) return out('usage: lens grep <pattern> [path...]');
   const targets = paths.length ? paths : ['.'];
+  const GREP = posixTool('grep');
+  if (!GREP) return out('lens grep needs a grep binary and found none on PATH or in Git for Windows. Install Git for Windows, or set LENS_GREP=<path to grep.exe>.');
   let lines = [];
   try {
     // -H forces the filename prefix. Without it, grep omits the name when given a SINGLE
     // file, so the per-file counting below reads line NUMBERS as filenames and reports
     // "3 matches in 3 files: 2089, 2629, 2708". Found within an hour of shipping, by use.
-    lines = execFileSync('grep', ['-rnIHE', '--exclude-dir=node_modules', '--exclude-dir=.git', pat, ...targets],
+    lines = execFileSync(GREP, ['-rnIHE', '--exclude-dir=node_modules', '--exclude-dir=.git', pat, ...targets],
       { encoding: 'utf8', maxBuffer: 1 << 26 }).split('\n').filter(Boolean);
   } catch (e) {
     if (e.status === 1) return out('(no matches)');
+    if (e.code === 'ENOENT') return out(`lens grep could not start ${GREP}. Set LENS_GREP=<path to grep>.`);
     // Over the 64 MB buffer. The tool's own rule applies to its failures: say it, do not
     // throw a stack trace at a reader who only wanted counts.
     if (e.code === 'ENOBUFS') return out(`output over 64 MB for "${pat}" in ${targets.join(' ')} — narrow the path or the pattern`);
@@ -303,9 +325,15 @@ function run(parts) {
   // command succeeds — it hands you both only on the throw path. A command exiting 0 while
   // writing warnings to stderr lost them silently, in the function whose whole job is not
   // to eat output. The test caught it within a minute of being written.
-  const res = spawnSync(process.platform === 'win32' ? process.env.COMSPEC || 'cmd' : 'sh',
-    process.platform === 'win32' ? ['/c', command] : ['-c', command],
-    { encoding: 'utf8', maxBuffer: 1 << 28 });
+  // A POSIX shell wherever one exists, Windows included: the commands an agent writes are
+  // POSIX. cmd.exe is the last resort, and when it is used that is SAID, because cmd reads
+  // `;`, `$(…)` and `>&2` differently and the result still looks like a clean run.
+  const SH = posixTool('sh');
+  const viaCmd = !SH;
+  const res = viaCmd
+    ? spawnSync(process.env.COMSPEC || 'cmd', ['/c', command], { encoding: 'utf8', maxBuffer: 1 << 28 })
+    : spawnSync(SH, ['-c', command], { encoding: 'utf8', maxBuffer: 1 << 28 });
+  if (viaCmd) out('⚠ no sh found (set LENS_SH or install Git for Windows): ran under cmd.exe, which does not read POSIX syntax (; $() >&2).');
   const stdout = res.stdout ?? '';
   const stderr = res.stderr ?? '';
   const code = res.error ? 1 : (typeof res.status === 'number' ? res.status : 1);
